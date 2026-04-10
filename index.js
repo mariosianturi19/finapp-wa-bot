@@ -204,6 +204,36 @@ async function handleMessage(jid, phone, text) {
       return;
     }
 
+    // !kategori
+    if (textLower === '!kategori' || textLower === 'kategori') {
+      try {
+        const { categories } = await getWallets(phone); // getWallets juga mengembalikan categories
+        if (!categories || categories.length === 0) {
+          await sendMsg(jid, '📂 Kamu belum punya kategori. Buat di aplikasi FinApp terlebih dahulu.');
+          return;
+        }
+        const expenses = categories.filter((c) => c.type === 'expense').map((c) => `  • ${c.name}`);
+        const incomes  = categories.filter((c) => c.type === 'income').map((c) => `  • ${c.name}`);
+        const lines = [
+          '📂 *Kategori Kamu:*', '',
+          '📤 *Pengeluaran:*',
+          ...(expenses.length > 0 ? expenses : ['  _(kosong)_']),
+          '',
+          '📥 *Pemasukan:*',
+          ...(incomes.length > 0 ? incomes : ['  _(kosong)_']),
+        ];
+        await sendMsg(jid, lines.join('\n'));
+      } catch (err) {
+        const code = err?.response?.data?.code;
+        if (code === 'PHONE_NOT_REGISTERED') {
+          await sendMsg(jid, '⚠️ Nomor WA kamu belum terdaftar. Buka FinApp → Settings → daftarkan nomor HP kamu.');
+        } else {
+          await sendMsg(jid, '❌ Gagal mengambil kategori. Coba lagi nanti.');
+        }
+      }
+      return;
+    }
+
     // !rekap
     if (textLower.startsWith('!rekap') || textLower.startsWith('rekap')) {
       try {

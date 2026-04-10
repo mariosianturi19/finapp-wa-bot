@@ -428,8 +428,18 @@ async function connectToWA() {
       if (!text) continue;
 
       // Ambil nomor HP pengirim (format: 628xxx@s.whatsapp.net)
-      const jid   = msg.key.remoteJid;
-      let phone   = jid.replace('@s.whatsapp.net', '').replace(/\D/g, '');
+      const jid      = msg.key.remoteJid;
+      const rawPhone = jid.replace('@s.whatsapp.net', '').replace(/\D/g, '');
+
+      // Validasi E.164: nomor HP asli maksimal 15 digit.
+      // Jika lebih dari itu, ini adalah WhatsApp LID (ID internal),
+      // bukan nomor HP asli — lewati saja pesan ini.
+      if (rawPhone.length > 15) {
+        console.log(`⚠️  JID bukan nomor HP (kemungkinan WhatsApp LID): ${jid} — diabaikan.`);
+        continue;
+      }
+
+      let phone = rawPhone;
       if (phone.startsWith('0')) phone = '62' + phone.slice(1);
 
       await handleMessage(jid, phone, text);

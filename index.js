@@ -26,18 +26,19 @@ const client = new Client({
   authStrategy: new LocalAuth({ clientId: 'finapp-bot' }),
   puppeteer: {
     headless: true,
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null, // Diperlukan untuk Docker/Cloud
+    // Pakai path dari env var (di-set di Dockerfile), fallback ke Debian path
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
     timeout: 60000,
     protocolTimeout: 300000,
     args: [
-      '--no-sandbox', 
-      '--disable-setuid-sandbox', 
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-accelerated-2d-canvas',
       '--no-first-run',
       '--no-zygote',
       '--single-process', // Penting untuk menghemat RAM di server gratis
-      '--disable-gpu'
+      '--disable-gpu',
     ],
   },
 });

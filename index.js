@@ -6,6 +6,7 @@ const qrcode    = require('qrcode-terminal');
 const axios     = require('axios');
 const http      = require('http');
 const path      = require('path');
+const fs        = require('fs');
 const pino      = require('pino');
 
 // ── Dummy Web Server (Untuk Render / Railway) ────────────────────────────────
@@ -103,22 +104,39 @@ function parseTransfer(text) {
 }
 
 // ── LID → Phone mapping (untuk resolve nomor WA multi-device) ───────────────
-// WhatsApp multi-device menggunakan LID (Linked-Device ID) sebagai identifer
-// internal. Ketika connect, Baileys menerima daftar kontak yang berisi mapping
-// antara LID dan nomor HP asli. Kita simpan peta ini untuk resolusi pesan.
 const lidToPhone = new Map();
+const pendingLidReg = new Map();            // LID → true (menunggu input nomor HP)
+const LID_MAP_FILE  = path.join(__dirname, '.wwebjs_auth', 'lid_map.json');
+
+// Load peta LID dari file (persistent across bot restarts selama container hidup)
+function loadLidMap() {
+  try {
+    const data = JSON.parse(fs.readFileSync(LID_MAP_FILE, 'utf-8'));
+    for (const [lid, phone] of Object.entries(data)) lidToPhone.set(lid, phone);
+    if (lidToPhone.size > 0)
+      console.log(`💾  Loaded ${lidToPhone.size} LID mapping dari file.`);
+  } catch { /* file belum ada, skip */ }
+}
+function saveLidMap() {
+  try {
+    fs.mkdirSync(path.dirname(LID_MAP_FILE), { recursive: true });
+    fs.writeFileSync(LID_MAP_FILE, JSON.stringify(Object.fromEntries(lidToPhone), null, 2));
+  } catch (e) { console.error('⚠️  Gagal simpan LID map:', e.message); }
+}
 
 function registerContact(contact) {
-  // contact.id  = phone JID  e.g. "628xxx@s.whatsapp.net"
-  // contact.lid = LID JID    e.g. "11145524072693@lid"
   if (contact?.id && contact?.lid) {
     const phone = contact.id.split('@')[0];
     const lid   = contact.lid.split('@')[0];
     if (phone && lid && lid !== phone) {
       lidToPhone.set(lid, phone);
+      saveLidMap();
     }
   }
 }
+
+// Load map saat startup
+loadLidMap();
 
 // ── API Calls ke Next.js ──────────────────────────────────────────────────────
 const HEADERS = () => ({ 'x-bot-api-key': BOT_API_KEY });
@@ -429,13 +447,42 @@ async function connectToWA() {
   // Simpan credentials saat update
   sock.ev.on('creds.update', saveCreds);
 
-  // Saat WhatsApp sync kontak, bangun peta LID → nomor HP
+  // Saat WhatsApp sync kontak & history chat, bangun peta LID → nomor HP
+  // contacts.upsert: daftar kontak; chats.upsert: history percakapan
+  // Keduanya bisa membawa LID-phone mapping, tergantung versi WA user
   sock.ev.on('contacts.upsert', (contacts) => {
     for (const c of contacts) registerContact(c);
-    console.log(`📋  Kontak tersinkron: ${lidToPhone.size} LID mapping tersedia.`);
+    if (lidToPhone.size > 0)
+      console.log(`📋  contacts.upsert: ${lidToPhone.size} LID mapping tersedia.`);
   });
   sock.ev.on('contacts.update', (updates) => {
     for (const c of updates) registerContact(c);
+  });
+
+  // Chat history sync juga sering berisi LID → phone mapping
+  sock.ev.on('chats.upsert', (chats) => {
+    let added = 0;
+    for (const chat of chats) {
+      if (chat.id && chat.lid) {
+        const phone = chat.id.split('@')[0];
+        const lid   = chat.lid.split('@')[0];
+        if (phone && lid && lid !== phone && !lidToPhone.has(lid)) {
+          lidToPhone.set(lid, phone);
+          added++;
+        }
+      }
+    }
+    if (added > 0)
+      console.log(`💬  chats.upsert: +${added} LID mapping baru (total: ${lidToPhone.size}).`);
+  });
+  sock.ev.on('chats.update', (updates) => {
+    for (const chat of updates) {
+      if (chat.id && chat.lid) {
+        const phone = chat.id.split('@')[0];
+        const lid   = chat.lid.split('@')[0];
+        if (phone && lid && lid !== phone) lidToPhone.set(lid, phone);
+      }
+    }
   });
 
   // Handle koneksi
@@ -490,14 +537,55 @@ async function connectToWA() {
 
       let phone;
       if (rawPhone.length > 13) {
-        // Kemungkinan LID — coba resolve dari map kontak yang sudah disync
+        // Kemungkinan LID — coba resolve dari map
         const resolved = lidToPhone.get(rawPhone);
         if (resolved) {
           phone = resolved;
-          console.log(`🔍  LID ${rawPhone} → resolve ke ${phone}`);
         } else {
-          // LID belum ada di map — bot belum pernah sync kontak ini
-          console.log(`⚠️  LID ${rawPhone} belum bisa diresolved (belum ada di kontak) — diabaikan.`);
+          // Belum bisa diresolved — jalankan alur self-registration
+          if (pendingLidReg.has(rawPhone)) {
+            // User sedang mengirim nomor HP mereka
+            const digits     = text.replace(/\D/g, '');
+            const normalized = digits.startsWith('0') ? '62' + digits.slice(1) : digits;
+
+            if (/^62\d{8,13}$/.test(normalized)) {
+              try {
+                await getWallets(normalized); // validasi: apakah nomor terdaftar di FinApp?
+                lidToPhone.set(rawPhone, normalized);
+                saveLidMap();
+                pendingLidReg.delete(rawPhone);
+                await sendMsg(jid,
+                  `✅ Nomor *${normalized}* berhasil didaftarkan!\n\n` +
+                  `Sekarang kamu bisa langsung pakai semua fitur bot.\n` +
+                  `Ketik *!help* untuk panduan lengkap.`
+                );
+              } catch (err) {
+                const code = err?.response?.data?.code;
+                if (code === 'PHONE_NOT_REGISTERED') {
+                  await sendMsg(jid,
+                    `⚠️ Nomor *${normalized}* belum terdaftar di FinApp.\n\n` +
+                    `Buka aplikasi FinApp → Settings → masukkan nomor HP kamu, lalu coba kirim nomor kamu lagi ke sini.`
+                  );
+                } else {
+                  await sendMsg(jid, '❌ Gagal validasi. Coba lagi nanti.');
+                }
+              }
+            } else {
+              await sendMsg(jid,
+                '⚠️ Format nomor tidak valid.\n\n' +
+                'Kirim nomor WA yang terdaftar di FinApp kamu:\n_Contoh: 081234567890_'
+              );
+            }
+          } else {
+            // Pertama kali user ini menghubungi bot — minta registrasi
+            pendingLidReg.set(rawPhone, true);
+            await sendMsg(jid,
+              '🤖 *Halo! Selamat datang di FinApp Bot!*\n\n' +
+              'WhatsApp versi kamu memerlukan verifikasi nomor HP *satu kali saja*.\n\n' +
+              '📱 Balas pesan ini dengan *nomor WA kamu* yang sudah kamu daftarkan di aplikasi FinApp:\n' +
+              '_Contoh: 081234567890_'
+            );
+          }
           continue;
         }
       } else {

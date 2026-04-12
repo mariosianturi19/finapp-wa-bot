@@ -102,6 +102,24 @@ function parseTransfer(text) {
   return { amount, from_query: parts[2], to_query: parts[3] };
 }
 
+// ── LID → Phone mapping (untuk resolve nomor WA multi-device) ───────────────
+// WhatsApp multi-device menggunakan LID (Linked-Device ID) sebagai identifer
+// internal. Ketika connect, Baileys menerima daftar kontak yang berisi mapping
+// antara LID dan nomor HP asli. Kita simpan peta ini untuk resolusi pesan.
+const lidToPhone = new Map();
+
+function registerContact(contact) {
+  // contact.id  = phone JID  e.g. "628xxx@s.whatsapp.net"
+  // contact.lid = LID JID    e.g. "11145524072693@lid"
+  if (contact?.id && contact?.lid) {
+    const phone = contact.id.split('@')[0];
+    const lid   = contact.lid.split('@')[0];
+    if (phone && lid && lid !== phone) {
+      lidToPhone.set(lid, phone);
+    }
+  }
+}
+
 // ── API Calls ke Next.js ──────────────────────────────────────────────────────
 const HEADERS = () => ({ 'x-bot-api-key': BOT_API_KEY });
 
@@ -411,6 +429,15 @@ async function connectToWA() {
   // Simpan credentials saat update
   sock.ev.on('creds.update', saveCreds);
 
+  // Saat WhatsApp sync kontak, bangun peta LID → nomor HP
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const c of contacts) registerContact(c);
+    console.log(`📋  Kontak tersinkron: ${lidToPhone.size} LID mapping tersedia.`);
+  });
+  sock.ev.on('contacts.update', (updates) => {
+    for (const c of updates) registerContact(c);
+  });
+
   // Handle koneksi
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -457,19 +484,26 @@ async function connectToWA() {
 
       if (!text) continue;
 
-      // Ambil nomor HP pengirim (format: 628xxx@s.whatsapp.net)
+      // Ambil nomor HP pengirim
       const jid      = msg.key.remoteJid;
-      const rawPhone = jid.replace('@s.whatsapp.net', '').replace(/\D/g, '');
+      const rawPhone = jid.replace('@s.whatsapp.net', '').replace('@lid', '').replace(/\D/g, '');
 
-      // Validasi E.164: nomor HP asli maksimal 15 digit.
-      // Jika lebih dari itu, ini adalah WhatsApp LID (ID internal),
-      // bukan nomor HP asli — lewati saja pesan ini.
-      if (rawPhone.length > 15) {
-        console.log(`⚠️  JID bukan nomor HP (kemungkinan WhatsApp LID): ${jid} — diabaikan.`);
-        continue;
+      let phone;
+      if (rawPhone.length > 13) {
+        // Kemungkinan LID — coba resolve dari map kontak yang sudah disync
+        const resolved = lidToPhone.get(rawPhone);
+        if (resolved) {
+          phone = resolved;
+          console.log(`🔍  LID ${rawPhone} → resolve ke ${phone}`);
+        } else {
+          // LID belum ada di map — bot belum pernah sync kontak ini
+          console.log(`⚠️  LID ${rawPhone} belum bisa diresolved (belum ada di kontak) — diabaikan.`);
+          continue;
+        }
+      } else {
+        phone = rawPhone;
       }
 
-      let phone = rawPhone;
       if (phone.startsWith('0')) phone = '62' + phone.slice(1);
 
       await handleMessage(jid, phone, text);
